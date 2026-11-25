@@ -568,13 +568,14 @@ def build_hyb(pos, cell="gru", window=None, gru=True):
 # its window. Mixed hybrid: GRU, then windowed-RoPE layers (local integration), then global NoPE layers (retrieval).
 
 class HybridMix(LM):
-    def __init__(self, window=256, local_first=True, local_depth=3):
+    def __init__(self, window=256, local_first=True, local_depth=None):
         super().__init__()
         from x_transformers import Decoder
         d = MODEL["dim"]
         self.emb = nn.Embedding(VOCAB, d)
         self.gru = nn.GRU(d, d, num_layers=1, batch_first=True)
         base = dict(dim=d, heads=MODEL["heads"], attn_dim_head=MODEL["dim_head"], attn_flash=True)
+        local_depth = local_depth or MODEL["depth"] // 2       # half local, half global (3 + 3 at the base size)
         local = Decoder(depth=local_depth, rotary_pos_emb=True, attn_max_attend_past=window, **base)
         glob = Decoder(depth=MODEL["depth"] - local_depth, **base)
         self.blocks = nn.ModuleList([local, glob] if local_first else [glob, local])
@@ -683,6 +684,36 @@ class TaylorLM(LM):
         for n1, attn, ff in self.layers:
             h = attn(n1(h)) + h
             h = ff(h) + h
+        return self.head(self.norm(h))
+
+
+# --------------------------------------------------------------------------- phase 11 (2026-11-20): one model for all three
+# Order matters (round 10): global-first (hyb_mix_r) = recall + update, local-first (hyb_mix) = state tracking.
+# Window 64 generalised best for state tracking. Candidates that try to keep both:
+
+class HybridStack(LM):
+    """GRU layer, then a sequence of single-layer attention blocks: 'L' = sliding window (RoPE), 'G' = global (NoPE)."""
+
+    def __init__(self, pattern, window=64):
+        super().__init__()
+        from x_transformers import Decoder
+        d = MODEL["dim"]
+        self.emb = nn.Embedding(VOCAB, d)
+        self.gru = nn.GRU(d, d, num_layers=1, batch_first=True)
+        base = dict(dim=d, depth=1, heads=MODEL["heads"], attn_dim_head=MODEL["dim_head"], attn_flash=True)
+        pattern = (pattern * MODEL["depth"])[:max(MODEL["depth"], len(pattern))]   # scaled models repeat the pattern
+        self.blocks = nn.ModuleList([
+            Decoder(rotary_pos_emb=True, attn_max_attend_past=window, **base) if c == "L" else Decoder(**base)
+            for c in pattern])
+        self.norm = nn.LayerNorm(d)
+        self.head = nn.Linear(d, VOCAB, bias=False)
+
+    def forward(self, x):
+        h = self.emb(x)
+        r, _ = self.gru(h)
+        h = h + r
+        for blk in self.blocks:
+            h = blk(h)
         return self.head(self.norm(h))
 
 
@@ -987,12 +1018,44 @@ REGISTRY = {
         build=build_performer, repo="(new) lucidrains/performer-pytorch", category="Attention", model="Performer",
         upstream=LUCID.format("performer-pytorch"), probe_max=8192, phase=10, role="memory candidate",
         unified=["causal FAVOR+ linear attention with rotary positions"]),
+    "hyb_alt64": dict(
+        build=lambda max_len: HybridStack("LGLGLG", 64), repo="(new) hybrid: GRU + local/global attention stack",
+        category="Long", model="HybridAlt_W64", upstream=LUCID.format("x-transformers") + ", pip 2.31.7 + torch.nn", probe_max=8192, phase=11, role="mixed hybrid memory",
+        unified=["GRU, then 6 single layers alternating sliding-window-64 RoPE and global NoPE (L G L G L G)"]),
+    "hyb_mix_r64": dict(
+        build=lambda max_len: HybridStack("GGGLLL", 64), repo="(new) hybrid: GRU + local/global attention stack",
+        category="Long", model="HybridMix_GlobalLocal_W64", upstream=LUCID.format("x-transformers") + ", pip 2.31.7 + torch.nn", probe_max=8192, phase=11, role="mixed hybrid memory",
+        unified=["hyb_mix_r with window 64: GRU, 3 global NoPE layers, 3 window-64 RoPE layers"]),
+    "hyb_mix64": dict(
+        build=lambda max_len: HybridStack("LLLGGG", 64), repo="(new) hybrid: GRU + local/global attention stack",
+        category="Long", model="HybridMix_LocalGlobal_W64", upstream=LUCID.format("x-transformers") + ", pip 2.31.7 + torch.nn", probe_max=8192, phase=11, role="mixed hybrid memory",
+        unified=["hyb_mix with window 64: GRU, 3 window-64 RoPE layers, 3 global NoPE layers"]),
 }
 
 
+SCALABLE = {"xt_rope", "xt_alibi", "gqa", "hyb_gru_nope", "hyb_gru_rope", "hyb_alt64", "hyb_mix", "hyb_gru_local"}
+
+
+def split_scale(name):
+    """'hyb_alt64@m' -> ('hyb_alt64', 'm'); plain names -> (name, None)."""
+    base, _, sc = name.partition("@")
+    return base, (sc or None)
+
+
 def build(name, max_len=MAX_LEN):
-    entry = REGISTRY[name]
-    model = entry["build"](max_len)
+    base, sc = split_scale(name)
+    entry = REGISTRY[base]
+    saved = dict(MODEL)
+    if sc:
+        from common.config import SCALES
+        if base not in SCALABLE or sc not in SCALES:
+            raise ValueError(f"{name}: scale '{sc}' not available for this model")
+        MODEL.update(SCALES[sc])      # builders read MODEL when they are called
+    try:
+        model = entry["build"](max_len)
+    finally:
+        MODEL.clear()
+        MODEL.update(saved)
     model.name = name
     model.micro_batch = entry.get("micro_batch")   # None = whole batch at once
     model.lr = entry.get("lr")                     # None = unified learning rate
@@ -1004,7 +1067,7 @@ def build(name, max_len=MAX_LEN):
 
 
 def repo_name(name):
-    e = REGISTRY[name]
+    e = REGISTRY[split_scale(name)[0]]
     return f"LM_Dec_{e['category']}_{e['model']}"
 
 
